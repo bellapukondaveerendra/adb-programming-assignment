@@ -1,0 +1,12 @@
+flask==2.3.3
+graphene==3.3
+graphene-mongo==0.2.15
+pymongo==4.5.0
+python-dotenv==1.0.0
+flask-cors==4.0.0
+streamlit==1.28.0
+requests==2.31.0
+pandas==2.1.0
+dnspython==2.4.2
+mongoengine==0.27.0
+gunicorn==21.2.0

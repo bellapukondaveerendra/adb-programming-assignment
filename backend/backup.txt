@@ -1,0 +1,795 @@
+# llm_processor.py - Fixed version with proper MongoDB connection handling
+import re
+import json
+from typing import Dict, Any, List
+from pymongo import MongoClient
+from mongoengine import connect
+from models import Movie, Genre
+import os
+
+class LLMProcessor:
+    def __init__(self, model_name="llama2"):
+        self.model_name = model_name
+        print(f"✅ Using enhanced rule-based processor with MongoDB query support")
+        
+        # MongoDB connection for direct queries
+        self.mongodb_uri = os.getenv('MONGODB_URI')
+        self.mongo_client = None
+        self.db = None
+        self.mongodb_connected = False
+        
+        if self.mongodb_uri:
+            try:
+                self.mongo_client = MongoClient(self.mongodb_uri)
+                # Test the connection
+                self.mongo_client.admin.command('ping')
+                self.db = self.mongo_client.imdb
+                self.mongodb_connected = True
+                print("✅ Connected to MongoDB for direct queries")
+            except Exception as e:
+                print(f"⚠️  MongoDB connection failed: {e}")
+                self.mongodb_connected = False
+        else:
+            print("⚠️  MongoDB URI not found - MongoDB queries will be simulated")
+        
+        # Define patterns for different operations
+        self.patterns = {
+            'show_all_movies': r'(show|get|find|list).*(all|every).*(movie|film)',
+            'movies_by_genre': r'(show|get|find).*(action|comedy|drama|thriller|horror|sci-fi|romance|fantasy|adventure|crime).*(movie|film)',
+            'movies_by_year': r'(show|get|find).*(movie|film).*(from|in|year).*(\d{4})',
+            'movies_by_rating': r'(show|get|find).*(movie|film).*(rating|rated).*(above|over|greater than|>)\s*(\d+\.?\d*)',
+            'movies_by_director': r'(show|get|find).*(movie|film).*(direct|made by|from).*([\w\s]+)',
+            'movies_by_actor': r'(show|get|find).*(movie|film).*(starring|with|actor).*([\w\s]+)',
+            'add_movie': r'(add|create|insert).*(new\s+)?(movie|film)',
+            'delete_movie': r'(delete|remove).*(movie|film)',
+            'update_movie': r'(update|modify|change).*(movie|film)',
+            'show_genres': r'(show|get|find|list).*(all|every).*(genre|category)',
+            'count_movies': r'(count|how many).*(movie|film)',
+            'average_rating': r'(average|mean).*(rating|score)',
+        }
+    
+    def natural_language_to_graphql(self, user_input: str) -> Dict[str, Any]:
+        """Convert natural language to GraphQL using pattern matching"""
+        
+        user_input_lower = user_input.lower()
+        
+        try:
+            # Show all movies
+            if re.search(self.patterns['show_all_movies'], user_input_lower):
+                return {
+                    'success': True,
+                    'graphql_query': '''
+                    query {
+                      allMovies {
+                        edges {
+                          node {
+                            title
+                            year
+                            rating
+                            genre
+                            directors
+                          }
+                        }
+                      }
+                    }
+                    ''',
+                    'original_input': user_input
+                }
+            
+            # Movies by genre
+            genre_match = re.search(self.patterns['movies_by_genre'], user_input_lower)
+            if genre_match:
+                genre = self._extract_genre(user_input_lower)
+                return {
+                    'success': True,
+                    'graphql_query': f'''
+                    query {{
+                      moviesByGenre(genre: "{genre}") {{
+                        title
+                        year
+                        rating
+                        genre
+                        directors
+                      }}
+                    }}
+                    ''',
+                    'original_input': user_input
+                }
+            
+            # Movies by year
+            year_match = re.search(self.patterns['movies_by_year'], user_input_lower)
+            if year_match:
+                year = re.search(r'\d{4}', user_input).group()
+                return {
+                    'success': True,
+                    'graphql_query': f'''
+                    query {{
+                      moviesByYear(year: {year}) {{
+                        title
+                        year
+                        rating
+                        genre
+                        directors
+                      }}
+                    }}
+                    ''',
+                    'original_input': user_input
+                }
+            
+            # Movies by rating
+            rating_match = re.search(self.patterns['movies_by_rating'], user_input_lower)
+            if rating_match:
+                rating_search = re.search(r'(\d+\.?\d*)', rating_match.group())
+                if rating_search:
+                    rating = rating_search.group()
+                    return {
+                        'success': True,
+                        'graphql_query': f'''
+                        query {{
+                          moviesByRating(minRating: {rating}) {{
+                            title
+                            year
+                            rating
+                            genre
+                            directors
+                          }}
+                        }}
+                        ''',
+                        'original_input': user_input
+                    }
+            
+            # Add movie
+            if re.search(self.patterns['add_movie'], user_input_lower):
+                title = self._extract_title(user_input)
+                return {
+                    'success': True,
+                    'graphql_query': f'''
+                    mutation {{
+                      createMovie(title: "{title}") {{
+                        movie {{
+                          title
+                          year
+                          rating
+                        }}
+                      }}
+                    }}
+                    ''',
+                    'original_input': user_input
+                }
+            
+            # Show genres
+            if re.search(self.patterns['show_genres'], user_input_lower):
+                return {
+                    'success': True,
+                    'graphql_query': '''
+                    query {
+                      allGenres {
+                        edges {
+                          node {
+                            name
+                            description
+                            movieCount
+                          }
+                        }
+                      }
+                    }
+                    ''',
+                    'original_input': user_input
+                }
+            
+            # Default fallback - show all movies
+            return {
+                'success': True,
+                'graphql_query': '''
+                query {
+                  allMovies {
+                    edges {
+                      node {
+                        title
+                        year
+                        rating
+                      }
+                    }
+                  }
+                }
+                ''',
+                'original_input': user_input,
+                'note': 'Used default query - try being more specific like "show action movies" or "movies from 2020"'
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'original_input': user_input
+            }
+    
+    def natural_language_to_mongodb(self, user_input: str) -> Dict[str, Any]:
+        """Convert natural language to MongoDB query and execute it"""
+        
+        user_input_lower = user_input.lower()
+        
+        try:
+            # Show all movies
+            if re.search(self.patterns['show_all_movies'], user_input_lower):
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'find',
+                    'filter': {},
+                    'projection': {'title': 1, 'year': 1, 'rating': 1, 'genre': 1, 'directors': 1},
+                    'limit': 20  # Limit results for better performance
+                }
+                
+            # Movies by genre
+            elif re.search(self.patterns['movies_by_genre'], user_input_lower):
+                genre = self._extract_genre(user_input_lower)
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'find',
+                    'filter': {'genre': {'$regex': genre, '$options': 'i'}},
+                    'projection': {'title': 1, 'year': 1, 'rating': 1, 'genre': 1}
+                }
+                
+            # Movies by year
+            elif re.search(self.patterns['movies_by_year'], user_input_lower):
+                year = int(re.search(r'\d{4}', user_input).group())
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'find',
+                    'filter': {'year': year},
+                    'projection': {'title': 1, 'year': 1, 'rating': 1, 'genre': 1}
+                }
+                
+            # Movies by rating
+            elif re.search(self.patterns['movies_by_rating'], user_input_lower):
+                rating_match = re.search(self.patterns['movies_by_rating'], user_input_lower)
+                rating_search = re.search(r'(\d+\.?\d*)', rating_match.group())
+                if rating_search:
+                    rating = float(rating_search.group())
+                    mongo_query = {
+                        'collection': 'movies',
+                        'operation': 'find',
+                        'filter': {'rating': {'$gte': rating}},
+                        'projection': {'title': 1, 'year': 1, 'rating': 1, 'genre': 1}
+                    }
+                else:
+                    raise ValueError("Could not extract rating value")
+                    
+            # Movies by director
+            elif re.search(self.patterns['movies_by_director'], user_input_lower):
+                director = self._extract_director(user_input)
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'find',
+                    'filter': {'directors': {'$regex': director, '$options': 'i'}},
+                    'projection': {'title': 1, 'year': 1, 'rating': 1, 'directors': 1}
+                }
+                
+            # Count movies
+            elif re.search(self.patterns['count_movies'], user_input_lower):
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'count_documents',
+                    'filter': {}
+                }
+                
+            # Average rating
+            elif re.search(self.patterns['average_rating'], user_input_lower):
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'aggregate',
+                    'pipeline': [
+                        {'$group': {'_id': None, 'average_rating': {'$avg': '$rating'}}},
+                        {'$project': {'_id': 0, 'average_rating': 1}}
+                    ]
+                }
+                
+            # Add movie
+            elif re.search(self.patterns['add_movie'], user_input_lower):
+                title = self._extract_title(user_input)
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'insert_one',
+                    'document': {
+                        'title': title,
+                        'year': 2024,  # Default values
+                        'rating': 0.0,
+                        'genre': ['Unknown'],
+                        'directors': ['Unknown'],
+                        'actors': ['Unknown']
+                    }
+                }
+                
+            # Show all genres
+            elif re.search(self.patterns['show_genres'], user_input_lower):
+                mongo_query = {
+                    'collection': 'genres',
+                    'operation': 'find',
+                    'filter': {},
+                    'projection': {'name': 1, 'description': 1, 'movie_count': 1}
+                }
+                
+            else:
+                # Default fallback
+                mongo_query = {
+                    'collection': 'movies',
+                    'operation': 'find',
+                    'filter': {},
+                    'projection': {'title': 1, 'year': 1, 'rating': 1},
+                    'limit': 10
+                }
+            
+            print(f"mongo_query {mongo_query}")
+            
+            # Execute the MongoDB query
+            result = self._execute_mongodb_query(mongo_query)
+            
+            return {
+                'success': True,
+                'mongodb_query': mongo_query,
+                'query_result': result,
+                'original_input': user_input
+            }
+            
+        except Exception as e:
+            print(f"Error in natural_language_to_mongodb: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'original_input': user_input
+            }
+    
+    def _execute_mongodb_query(self, query_info: Dict[str, Any]) -> Any:
+        """Execute MongoDB query and return results"""
+        
+        # Check if MongoDB is connected properly
+        if not self.mongodb_connected or self.db is None:
+            return {
+                'error': 'MongoDB connection not available', 
+                'simulated': True,
+                'note': 'Please check your MongoDB connection string in .env file'
+            }
+        
+        try:
+            collection = self.db[query_info['collection']]
+            operation = query_info['operation']
+            
+            print(f"Executing {operation} on collection {query_info['collection']}")
+            
+            if operation == 'find':
+                cursor = collection.find(
+                    query_info['filter'],
+                    query_info.get('projection')
+                )
+                
+                # Apply limit if specified
+                if 'limit' in query_info:
+                    cursor = cursor.limit(query_info['limit'])
+                
+                results = list(cursor)
+                
+                # Convert ObjectId to string for JSON serialization
+                for result in results:
+                    if '_id' in result:
+                        result['_id'] = str(result['_id'])
+                
+                return {
+                    'results': results,
+                    'count': len(results),
+                    'operation': operation
+                }
+                
+            elif operation == 'count_documents':
+                count = collection.count_documents(query_info['filter'])
+                return {
+                    'count': count,
+                    'operation': operation
+                }
+                
+            elif operation == 'aggregate':
+                results = list(collection.aggregate(query_info['pipeline']))
+                return {
+                    'results': results,
+                    'operation': operation
+                }
+                
+            elif operation == 'insert_one':
+                result = collection.insert_one(query_info['document'])
+                return {
+                    'inserted_id': str(result.inserted_id),
+                    'acknowledged': result.acknowledged,
+                    'operation': operation
+                }
+                
+            elif operation == 'update_one':
+                result = collection.update_one(
+                    query_info['filter'],
+                    query_info['update']
+                )
+                return {
+                    'matched_count': result.matched_count,
+                    'modified_count': result.modified_count,
+                    'operation': operation
+                }
+                
+            elif operation == 'delete_one':
+                result = collection.delete_one(query_info['filter'])
+                return {
+                    'deleted_count': result.deleted_count,
+                    'operation': operation
+                }
+                
+            else:
+                return {'error': f'Unsupported operation: {operation}'}
+                
+        except Exception as e:
+            print(f"MongoDB execution error: {e}")
+            return {'error': f'MongoDB execution failed: {str(e)}'}
+    
+    def _extract_genre(self, text: str) -> str:
+        """Extract genre from text"""
+        genres = ['action', 'comedy', 'drama', 'thriller', 'horror', 'sci-fi', 'romance', 'fantasy', 'adventure', 'crime']
+        for genre in genres:
+            if genre in text:
+                return genre.title()
+        return 'Action'  # Default
+    
+    def _extract_title(self, text: str) -> str:
+        """Extract movie title from text"""
+        # Look for quoted strings
+        quote_match = re.search(r'["\']([^"\']+)["\']', text)
+        if quote_match:
+            return quote_match.group(1)
+        
+        # Look for "called" or "named"
+        called_match = re.search(r'(called|named)\s+([A-Za-z0-9\s]+)', text, re.IGNORECASE)
+        if called_match:
+            # Clean up the extracted title
+            title = called_match.group(2).strip()
+            # Remove common trailing words
+            title = re.sub(r'\s+(with|having|rated|from).*$', '', title, flags=re.IGNORECASE)
+            return title
+        
+        return "New Movie"  # Default
+    
+    def _extract_director(self, text: str) -> str:
+        """Extract director name from text"""
+        # Look for "directed by" or "made by"
+        director_match = re.search(r'(directed by|made by|from)\s+([A-Za-z\s]+)', text, re.IGNORECASE)
+        if director_match:
+            director = director_match.group(2).strip()
+            # Clean up common trailing words
+            director = re.sub(r'\s+(movies|films|movie|film).*$', '', director, flags=re.IGNORECASE)
+            return director
+        
+        return "Unknown Director"
+    
+    def compare_graphql_vs_mongodb(self, user_input: str) -> Dict[str, Any]:
+        """Compare GraphQL and MongoDB approaches for the same query"""
+        
+        graphql_result = self.natural_language_to_graphql(user_input)
+        mongodb_result = self.natural_language_to_mongodb(user_input)
+        
+        return {
+            'user_input': user_input,
+            'graphql_approach': graphql_result,
+            'mongodb_approach': mongodb_result,
+            'comparison': {
+                'graphql_success': graphql_result.get('success', False),
+                'mongodb_success': mongodb_result.get('success', False),
+                'both_successful': graphql_result.get('success', False) and mongodb_result.get('success', False)
+            }
+        }
+    
+    def get_connection_status(self) -> Dict[str, Any]:
+        """Get connection status information"""
+        return {
+            'mongodb_connected': self.mongodb_connected,
+            'mongodb_uri_provided': self.mongodb_uri is not None,
+            'database_name': 'imdb' if self.mongodb_connected else None
+        }
+
+
+
+
+
+
+
+
+
+        ====================================
+
+
+        # import graphene
+# from graphene_mongo import MongoengineObjectType, MongoengineConnectionField
+# from models import Movie, Genre
+# from mongoengine import Q
+
+# class MovieType(MongoengineObjectType):
+#     class Meta:
+#         model = Movie
+#         interfaces = (graphene.relay.Node,)
+
+# class GenreType(MongoengineObjectType):
+#     class Meta:
+#         model = Genre
+#         interfaces = (graphene.relay.Node,)
+
+# class Query(graphene.ObjectType):
+#     node = graphene.relay.Node.Field()
+    
+#     # Movie queries
+#     all_movies = MongoengineConnectionField(MovieType)
+#     movie_by_id = graphene.Field(MovieType, id=graphene.String())
+#     movies_by_genre = graphene.List(MovieType, genre=graphene.String())
+#     movies_by_year = graphene.List(MovieType, year=graphene.Int())
+#     movies_by_rating = graphene.List(MovieType, min_rating=graphene.Float())
+    
+#     # Genre queries
+#     all_genres = MongoengineConnectionField(GenreType)
+#     genre_by_name = graphene.Field(GenreType, name=graphene.String())
+    
+#     def resolve_movie_by_id(self, info, id):
+#         return Movie.objects(id=id).first()
+    
+#     def resolve_movies_by_genre(self, info, genre):
+#         return Movie.objects(genre__icontains=genre)
+    
+#     def resolve_movies_by_year(self, info, year):
+#         return Movie.objects(year=year)
+    
+#     def resolve_movies_by_rating(self, info, min_rating):
+#         return Movie.objects(rating__gte=min_rating)
+    
+#     def resolve_genre_by_name(self, info, name):
+#         return Genre.objects(name=name).first()
+
+# class CreateMovie(graphene.Mutation):
+#     class Arguments:
+#         title = graphene.String(required=True)
+#         genre = graphene.List(graphene.String)
+#         description = graphene.String()
+#         directors = graphene.List(graphene.String)
+#         actors = graphene.List(graphene.String)
+#         year = graphene.Int()
+#         runtime_minutes = graphene.Int()
+#         rating = graphene.Float()
+#         votes = graphene.Int()
+#         revenue_millions = graphene.Float()
+    
+#     movie = graphene.Field(lambda: MovieType)
+    
+#     def mutate(self, info, title, **kwargs):
+#         movie = Movie(title=title, **kwargs)
+#         movie.save()
+#         return CreateMovie(movie=movie)
+
+# class UpdateMovie(graphene.Mutation):
+#     class Arguments:
+#         id = graphene.String(required=True)
+#         title = graphene.String()
+#         genre = graphene.List(graphene.String)
+#         description = graphene.String()
+#         directors = graphene.List(graphene.String)
+#         actors = graphene.List(graphene.String)
+#         year = graphene.Int()
+#         runtime_minutes = graphene.Int()
+#         rating = graphene.Float()
+#         votes = graphene.Int()
+#         revenue_millions = graphene.Float()
+    
+#     movie = graphene.Field(lambda: MovieType)
+    
+#     def mutate(self, info, id, **kwargs):
+#         movie = Movie.objects(id=id).first()
+#         if movie:
+#             for key, value in kwargs.items():
+#                 if value is not None:
+#                     setattr(movie, key, value)
+#             movie.save()
+#         return UpdateMovie(movie=movie)
+
+# class DeleteMovie(graphene.Mutation):
+#     class Arguments:
+#         id = graphene.String(required=True)
+    
+#     success = graphene.Boolean()
+    
+#     def mutate(self, info, id):
+#         movie = Movie.objects(id=id).first()
+#         if movie:
+#             movie.delete()
+#             return DeleteMovie(success=True)
+#         return DeleteMovie(success=False)
+
+# class CreateGenre(graphene.Mutation):
+#     class Arguments:
+#         name = graphene.String(required=True)
+#         description = graphene.String()
+    
+#     genre = graphene.Field(lambda: GenreType)
+    
+#     def mutate(self, info, name, description=None):
+#         genre = Genre(name=name, description=description)
+#         genre.save()
+#         return CreateGenre(genre=genre)
+
+# class Mutation(graphene.ObjectType):
+#     create_movie = CreateMovie.Field()
+#     update_movie = UpdateMovie.Field()
+#     delete_movie = DeleteMovie.Field()
+#     create_genre = CreateGenre.Field()
+
+# schema = graphene.Schema(query=Query, mutation=Mutation)
+
+
+# schema.py - Updated version with fixes for the queryset error
+# schema.py - Minimal fix for your existing code
+# import graphene
+# from graphene_mongo import MongoengineObjectType, MongoengineConnectionField
+# from models import Movie, Genre
+# from mongoengine import Q
+
+# class MovieType(MongoengineObjectType):
+#     class Meta:
+#         model = Movie
+#         interfaces = (graphene.relay.Node,)
+
+# class GenreType(MongoengineObjectType):
+#     class Meta:
+#         model = Genre
+#         interfaces = (graphene.relay.Node,)
+
+# class Query(graphene.ObjectType):
+#     node = graphene.relay.Node.Field()
+    
+#     # Movie queries
+#     all_movies = MongoengineConnectionField(MovieType)
+#     movie_by_id = graphene.Field(MovieType, id=graphene.String())
+#     movies_by_genre = graphene.List(MovieType, genre=graphene.String())
+#     movies_by_year = graphene.List(MovieType, year=graphene.Int())
+#     movies_by_rating = graphene.List(MovieType, min_rating=graphene.Float())
+    
+#     # Genre queries
+#     all_genres = MongoengineConnectionField(GenreType)
+#     genre_by_name = graphene.Field(GenreType, name=graphene.String())
+    
+#     # ADD THESE RESOLVERS - This is the key fix
+#     def resolve_all_movies(self, info, **kwargs):
+#         return Movie.objects.all()
+    
+#     def resolve_all_genres(self, info, **kwargs):
+#         return Genre.objects.all()
+    
+#     # Keep your existing resolvers exactly as they are
+#     def resolve_movie_by_id(self, info, id):
+#         return Movie.objects(id=id).first()
+    
+#     def resolve_movies_by_genre(self, info, genre):
+#         return Movie.objects(genre__icontains=genre)
+    
+#     def resolve_movies_by_year(self, info, year):
+#         return Movie.objects(year=year)
+    
+#     def resolve_movies_by_rating(self, info, min_rating):
+#         return Movie.objects(rating__gte=min_rating)
+    
+#     def resolve_genre_by_name(self, info, name):
+#         return Genre.objects(name=name).first()
+
+# # Keep all your existing mutations exactly as they are
+# class CreateMovie(graphene.Mutation):
+#     class Arguments:
+#         title = graphene.String(required=True)
+#         genre = graphene.List(graphene.String)
+#         description = graphene.String()
+#         directors = graphene.List(graphene.String)
+#         actors = graphene.List(graphene.String)
+#         year = graphene.Int()
+#         runtime_minutes = graphene.Int()
+#         rating = graphene.Float()
+#         votes = graphene.Int()
+#         revenue_millions = graphene.Float()
+    
+#     movie = graphene.Field(lambda: MovieType)
+    
+#     def mutate(self, info, title, **kwargs):
+#         movie = Movie(title=title, **kwargs)
+#         movie.save()
+#         return CreateMovie(movie=movie)
+
+# class UpdateMovie(graphene.Mutation):
+#     class Arguments:
+#         id = graphene.String(required=True)
+#         title = graphene.String()
+#         genre = graphene.List(graphene.String)
+#         description = graphene.String()
+#         directors = graphene.List(graphene.String)
+#         actors = graphene.List(graphene.String)
+#         year = graphene.Int()
+#         runtime_minutes = graphene.Int()
+#         rating = graphene.Float()
+#         votes = graphene.Int()
+#         revenue_millions = graphene.Float()
+    
+#     movie = graphene.Field(lambda: MovieType)
+    
+#     def mutate(self, info, id, **kwargs):
+#         movie = Movie.objects(id=id).first()
+#         if movie:
+#             for key, value in kwargs.items():
+#                 if value is not None:
+#                     setattr(movie, key, value)
+#             movie.save()
+#         return UpdateMovie(movie=movie)
+
+# class DeleteMovie(graphene.Mutation):
+#     class Arguments:
+#         id = graphene.String(required=True)
+    
+#     success = graphene.Boolean()
+    
+#     def mutate(self, info, id):
+#         movie = Movie.objects(id=id).first()
+#         if movie:
+#             movie.delete()
+#             return DeleteMovie(success=True)
+#         return DeleteMovie(success=False)
+
+# class CreateGenre(graphene.Mutation):
+#     class Arguments:
+#         name = graphene.String(required=True)
+#         description = graphene.String()
+    
+#     genre = graphene.Field(lambda: GenreType)
+    
+#     def mutate(self, info, name, description=None):
+#         genre = Genre(name=name, description=description)
+#         genre.save()
+#         return CreateGenre(genre=genre)
+
+# class Mutation(graphene.ObjectType):
+#     create_movie = CreateMovie.Field()
+#     update_movie = UpdateMovie.Field()
+#     delete_movie = DeleteMovie.Field()
+#     create_genre = CreateGenre.Field()
+
+# schema = graphene.Schema(query=Query, mutation=Mutation)
+
+
+
+==============================================
+
+
+# # models.py - Fixed to match real data structure
+# from mongoengine import Document, StringField, ListField, IntField, FloatField
+
+# class Movie(Document):
+#     meta = {'collection': 'movies'}
+    
+#     title = StringField(required=True, max_length=200)
+#     genres = ListField(StringField(max_length=50))  # Changed to plural to match real data
+#     description = StringField()
+#     directors = ListField(StringField(max_length=100))
+#     actors = ListField(StringField(max_length=100))
+#     year = IntField()
+#     runtime_minutes = IntField()
+#     rating = FloatField()
+#     votes = IntField()
+#     revenue_millions = FloatField()
+    
+#     # Add backward compatibility property for GraphQL
+#     @property
+#     def genre(self):
+#         """Backward compatibility - return genres as genre"""
+#         return self.genres or []
+
+# class Genre(Document):
+#     meta = {'collection': 'genres'}
+    
+#     name = StringField(required=True, unique=True, max_length=50)
+#     description = StringField()
+#     movie_count = IntField(default=0)
+
+
+# models.py - FINAL VERSION - Exact match to database schema

@@ -2493,6 +2493,8 @@ Examples:
         
         return filters
     
+        # llm_processor.py - FIXED _execute_mongodb_query method excerpt
+
     def _execute_mongodb_query(self, query_info: Dict[str, Any]) -> Any:
         """Execute MongoDB query and return results - FIXED ObjectId serialization"""
         
@@ -2547,12 +2549,13 @@ Examples:
             elif operation == 'insert_one':
                 result = collection.insert_one(query_info['document'])
                 
-                # FIXED: Don't include the document with ObjectId in response
-                # Just return the converted ID and metadata
+                # FIXED: Return clean response without the original document containing ObjectId
                 return {
                     'inserted_id': str(result.inserted_id),
                     'acknowledged': result.acknowledged,
                     'operation': operation
+                    # REMOVED: The problematic line that included the full document with ObjectId
+                    # 'document': query_info['document']  # This was causing the JSON serialization error
                 }
                 
             elif operation == 'update_one':
@@ -2581,12 +2584,19 @@ Examples:
                 }
                 
             else:
-                return {'error': f'Unsupported operation: {operation}'}
+                return {
+                    'error': f'Unsupported operation: {operation}',
+                    'supported_operations': ['find', 'insert_one', 'update_one', 'delete_one', 'count_documents', 'aggregate']
+                }
                 
         except Exception as e:
-            print(f"MongoDB execution error: {e}")
-            return {'error': f'MongoDB execution failed: {str(e)}'}
-    
+            print(f"MongoDB query execution error: {e}")
+            return {
+                'error': str(e),
+                'operation': query_info.get('operation', 'unknown')
+            }
+
+
     def compare_graphql_vs_mongodb(self, user_input: str) -> Dict[str, Any]:
         """Compare GraphQL and MongoDB approaches for the same query"""
         
